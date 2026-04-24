@@ -1,6 +1,6 @@
 # 🎮 Rewrite-AI (AI-based Dynamic Difficulty Adjustment (DDA) Server)
 
-본 프로젝트는 유저의 플레이 데이터를 실시간으로 분석하여 **숙련도(Skill Level)와 이탈 위험도(Churn Risk)**를 예측하고, 이를 바탕으로 게임의 난이도를 동적으로 조절(DDA)하는 AI 학습 및 추론 서버입니다.
+본 프로젝트는 유저의 플레이 데이터를 실시간으로 분석하여 숙련도(Skill Level)와 이탈 위험도(Churn Risk)를 예측하고, 이를 바탕으로 게임의 난이도를 동적으로 조절(DDA)하는 AI 학습 및 추론 서버입니다.
 
 ## 🚀 Key Features
 - **시계열 데이터 처리**: 30초 단위 슬라이딩 윈도우 기반의 유저 로그 분석.
