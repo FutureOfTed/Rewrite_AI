@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+requests
+pydantic
+pydantic-settings
+aiohttp
+pandas
+numpy
+scikit-learn
+torch
+onnx
