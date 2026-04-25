@@ -213,63 +213,61 @@ def export_to_onnx(model: DDA_GRU_MultiTask, save_path: str):
     logger.info(f"ONNX 변환 완료: {save_path}")
 
 
-def execute(raw_data_list: list, output_dir: str = "app/models/artifacts") -> dict:
+def execute(
+    raw_data_list: list,
+    output_dir: str = "app/models/artifacts",
+    is_finetune: bool = False,
+    base_model_path: str = None
+) -> dict:
     """
-    전체 학습 파이프라인 진입점.
-
-    흐름
-    ----
-    원시 데이터(raw_data_list) → 전처리/피처 계산 → 슬라이딩 윈도우
-    → 정규화 → 데이터셋 분할 → GRU 학습 (Early Stopping)
-    → 평가 (RMSE / F1) → 가중치 저장(.pt) → ONNX 변환
+    전체 학습 파이프라인 진입점. (파인튜닝 지원)
 
     Parameters
     ----------
-    raw_data_list : 백엔드에서 수신한 웨이브 JSON 원시 데이터 리스트
-    output_dir    : 모델 파일 저장 디렉토리
-
-    Returns
-    -------
-    dict: { "rmse", "f1_score", "pt_path", "onnx_path" }
+    raw_data_list   : 백엔드에서 수신한 웨이브 JSON 원시 데이터 리스트
+    output_dir      : 모델 파일 저장 디렉토리
+    is_finetune     : 기존 모델 가중치를 기반으로 미세 조정을 할지 여부
+    base_model_path : 파인튜닝 시 로드할 기초 모델(.pt) 경로
     """
     os.makedirs(output_dir, exist_ok=True)
     device = _get_device()
+    logger.info(f"파이프라인 시작 (Mode: {'Fine-Tuning' if is_finetune else 'Initial Training'})")
 
     # ── 1. 전처리: 피처 계산 + C/S 레이블 추론 ───────────────────────────
-    logger.info("전처리 시작...")
+    logger.info("전처리 및 레이블링 중...")
     sample_list = []
 
     for wave_idx, raw_data in enumerate(raw_data_list):
-        feature_df, raw_df = clean_and_feature_engineering(raw_data)
-        if feature_df.empty:
-            logger.warning(f"웨이브 {wave_idx}: 유효 데이터 없음, 스킵")
+        try:
+            feature_df, raw_df = clean_and_feature_engineering(raw_data)
+            if feature_df.empty:
+                continue
+
+            windows = create_sliding_windows(feature_df, window_size=WINDOW_SIZE)
+            if windows.size == 0:
+                continue
+
+            s_label = compute_skill_label(feature_df)
+            c_label = compute_churn_label(
+                feature_df=feature_df,
+                raw_data=raw_data,
+                wave_index=wave_idx,
+                session_history=[],
+            )
+
+            sample_list.append({
+                "tensor":  windows,
+                "s_label": s_label,
+                "c_label": c_label,
+            })
+        except Exception as e:
+            logger.error(f"웨이브 {wave_idx} 처리 중 오류: {e}")
             continue
-
-        # 슬라이딩 윈도우 생성 (이상치 필터링 포함)
-        windows = create_sliding_windows(feature_df, window_size=WINDOW_SIZE)
-        if windows.size == 0:
-            logger.warning(f"웨이브 {wave_idx}: 유효 윈도우 없음 (이상치 제거 후), 스킵")
-            continue
-
-        s_label = compute_skill_label(feature_df)
-        c_label = compute_churn_label(
-            feature_df=feature_df,
-            raw_data=raw_data,
-            wave_index=wave_idx,
-            session_history=[],  # 세션 단위 히스토리는 호출부에서 관리
-        )
-
-        sample_list.append({
-            "tensor":  windows,
-            "s_label": s_label,
-            "c_label": c_label,
-        })
 
     if not sample_list:
         raise ValueError("전처리 후 유효한 학습 샘플이 없습니다.")
 
     # ── 2. 정규화 및 데이터셋 조립 ────────────────────────────────────────
-    logger.info("텐서 조립 및 정규화 중...")
     X, y_s, y_c = build_dataset(sample_list)
     X = normalize_tensor(X)
 
@@ -284,32 +282,47 @@ def execute(raw_data_list: list, output_dir: str = "app/models/artifacts") -> di
         dropout=DROPOUT,
     ).to(device)
 
-    optimizer    = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    loss_fn_bce  = nn.BCELoss()   # C(이탈 위험도) 분류 손실
-    loss_fn_mse  = nn.MSELoss()   # S(숙련도) 회귀 손실
+    # 파인튜닝 설정: 기존 가중치 로드 및 GRU 레이어 동결
+    actual_lr = LEARNING_RATE
+    if is_finetune and base_model_path:
+        if os.path.exists(base_model_path):
+            logger.info(f"기초 모델 로드: {base_model_path}")
+            model.load_state_dict(torch.load(base_model_path, map_location=device))
+
+            # GRU 특징 추출 레이어 동결 (이미 학습된 시계열 지식 유지)
+            for param in model.gru.parameters():
+                param.requires_grad = False
+            
+            actual_lr = 0.0001  # 파인튜닝 시 낮은 학습률 적용
+            logger.info("GRU 레이어 동결 및 파인튜닝 학습률(0.0001) 설정 완료")
+        else:
+            logger.warning(f"기초 모델을 찾을 수 없어 신규 학습으로 전환합니다: {base_model_path}")
+
+    # 동결되지 않은(requires_grad=True) 파라미터만 옵티마이저에 등록
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=actual_lr
+    )
+    loss_fn_bce = nn.BCELoss()
+    loss_fn_mse = nn.MSELoss()
 
     # ── 5. 학습 루프 + Early Stopping ─────────────────────────────────────
-    logger.info("학습 시작...")
-    best_val_loss   = float("inf")
+    logger.info("학습 루프 진입...")
+    best_val_loss = float("inf")
     patience_counter = 0
     best_weights_path = os.path.join(output_dir, "best_weights.pt")
 
     for epoch in range(1, MAX_EPOCHS + 1):
-        train_loss = _train_one_epoch(
-            model, train_loader, optimizer, loss_fn_bce, loss_fn_mse, device
-        )
+        train_loss = _train_one_epoch(model, train_loader, optimizer, loss_fn_bce, loss_fn_mse, device)
         val_metrics = _evaluate(model, val_loader, loss_fn_bce, loss_fn_mse, device)
-        val_loss    = val_metrics["loss"]
+        val_loss = val_metrics["loss"]
 
         logger.info(
             f"[Epoch {epoch:>3}/{MAX_EPOCHS}] "
-            f"Train Loss: {train_loss:.4f} | "
-            f"Val Loss: {val_loss:.4f} | "
-            f"Val RMSE: {val_metrics['rmse']:.4f} | "
-            f"Val F1: {val_metrics['f1_score']:.4f}"
+            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+            f"RMSE: {val_metrics['rmse']:.4f} | F1: {val_metrics['f1_score']:.4f}"
         )
 
-        # 검증 손실 개선 시 → 최적 가중치 저장
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
@@ -319,24 +332,14 @@ def execute(raw_data_list: list, output_dir: str = "app/models/artifacts") -> di
             patience_counter += 1
             logger.info(f"개선 없음 ({patience_counter}/{EARLY_STOP_PATIENCE})")
 
-        # Early Stopping: patience 초과시 조기 종료
         if patience_counter >= EARLY_STOP_PATIENCE:
             logger.info(f"Early Stopping 발동! (Epoch {epoch}에서 학습 종료)")
             break
 
-    # ── 6. 최종 평가 (Test 데이터셋) ──────────────────────────────────────
-    logger.info("테스트 데이터셋 최종 평가 중...")
-
-    # 최적 가중치 복원 후 평가
+    # ── 6. 최종 평가 및 ONNX 변환 ────────────────────────────────────────
     model.load_state_dict(torch.load(best_weights_path, map_location=device))
     test_metrics = _evaluate(model, test_loader, loss_fn_bce, loss_fn_mse, device)
-    logger.info(
-        f"[최종 테스트 결과] "
-        f"RMSE: {test_metrics['rmse']:.4f} | "
-        f"F1-Score: {test_metrics['f1_score']:.4f}"
-    )
-
-    # ── 7. ONNX 변환 및 저장 ──────────────────────────────────────────────
+    
     onnx_path = os.path.join(output_dir, "DDA_GRU_MultiTask.onnx")
     export_to_onnx(model, onnx_path)
 
@@ -346,5 +349,5 @@ def execute(raw_data_list: list, output_dir: str = "app/models/artifacts") -> di
         "pt_path":   best_weights_path,
         "onnx_path": onnx_path,
     }
-    logger.info(f"학습 파이프라인 완료: {metrics}")
+    logger.info(f"파이프라인 완료: {metrics}")
     return metrics

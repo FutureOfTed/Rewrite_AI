@@ -29,3 +29,10 @@ class MetricsReportRequest(BaseModel):
 class CompleteOnnxRequest(BaseModel):
     version_id: str
     # 추가 메타데이터
+
+class DatasetWebhookPayload(BaseModel):
+    job_id: str
+    version_id: str
+    datasets: List[DatasetLinkInfo]
+    is_finetune: bool = False
+    base_model_path: Optional[str] = None

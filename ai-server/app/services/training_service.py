@@ -1,52 +1,79 @@
 import logging
-from app.schemas.backend_contracts import JobStartRequest
+import os
+import json
+from typing import List
+from app.schemas.backend_contracts import DatasetLinkInfo
 from app.services import backend_client, presigned_transfer_service
+from app.pipelines import train_pipeline
 
 logger = logging.getLogger(__name__)
 
-async def run_training_pipeline(job_id: str, request: JobStartRequest):
+async def run_training_pipeline(
+    job_id: str,
+    version_id: str,
+    datasets: List[DatasetLinkInfo],
+    is_finetune: bool = False,
+    base_model_path: str = None
+):
     """
-    학습 오케스트레이션: 데이터 다운로드 -> 학습 -> 평가 -> 모델 변환 -> 업로드
+    학습 오케스트레이션 워커: 데이터 수집 -> 학습(또는 파인튜닝) -> 평가 -> 업로드
     """
-    try:
-        # 1. 진행 상태: 학습 시작 준비 (10%)
-        await backend_client.report_progress(job_id, 10, "IN_PROGRESS", "Starting training pipeline")
+    temp_dir = f"temp_data/{job_id}"
+    os.makedirs(temp_dir, exist_ok=True)
 
-        # 2. 백엔드로부터 데이터셋 다운로드 링크 요청
-        dataset_links = await backend_client.get_dataset_links(job_id)
+    try:
+        # 1. 진행 상태: 시작 보고 (10%)
+        await backend_client.report_progress(job_id, 10, "RUNNING", "Initializing training pipeline")
+
+        # 2. 데이터 다운로드 (S3 -> AI Server)
+        raw_data_list = []
+        for i, link in enumerate(datasets):
+            dest_path = os.path.join(temp_dir, f"sample_{i}.json")
+            await presigned_transfer_service.download_file(link.download_url, dest_path)
+            
+            # 다운로드한 JSON 로드
+            with open(dest_path, "r", encoding="utf-8") as f:
+                raw_data_list.append(json.load(f))
         
-        # 3. Presigned GET URL로 데이터 다운로드
-        for link_info in dataset_links:
-            await presigned_transfer_service.download_file(
-                url=link_info.download_url,
-                dest_path=f"/tmp/{link_info.file_name}"
-            )
-        
-        # 4. 진행 상태: 다운로드 완료, 학습 시작 (30%)
-        await backend_client.report_progress(job_id, 30, "IN_PROGRESS", "Data downloaded, starting training")
-        
-        # 5. 파이프라인(전처리->학습->평가) 실행 (가정)
-        # metrics, onnx_path = train_pipeline.execute(...)
-        metrics = {"rmse": 0.5, "f1_score": 0.85}
-        
-        # 6. 진행 상태: 평가 완료 (60%)
-        await backend_client.report_progress(job_id, 60, "IN_PROGRESS", "Training and evaluation completed")
+        await backend_client.report_progress(job_id, 30, "RUNNING", f"Downloaded {len(raw_data_list)} datasets")
+
+        # 3. 학습 실행 (Fine-tuning 지원)
+        logger.info(f"[{job_id}] Starting {'fine-tuning' if is_finetune else 'training'}...")
+        results = train_pipeline.execute(
+            raw_data_list=raw_data_list,
+            output_dir=f"app/models/artifacts/{job_id}",
+            is_finetune=is_finetune,
+            base_model_path=base_model_path
+        )
+
+        # 4. 평가 지표 보고 (60%)
+        metrics = {
+            "rmse": round(float(results["rmse"]), 4),
+            "f1_score": round(float(results["f1_score"]), 4)
+        }
         await backend_client.report_metrics(job_id, metrics)
-        
-        # 7. 백엔드로부터 모델 업로드용 Presigned PUT 링크 요청
-        upload_link_info = await backend_client.issue_onnx_upload_link(job_id, "v1", "model.onnx")
-        
-        # 8. Presigned PUT URL로 ONNX 파일 업로드
-        # await presigned_transfer_service.upload_file(
-        #     url=upload_link_info.upload_url,
-        #     file_path=onnx_path
-        # )
-        
-        # 9. 완료 처리: onnx-complete 콜백 전송 (100%)
-        await backend_client.complete_onnx(job_id, "v1")
+        await backend_client.report_progress(job_id, 80, "RUNNING", "Training completed, uploading model...")
+
+        # 5. 모델 업로드 (S3 Presigned PUT)
+        upload_info = await backend_client.issue_onnx_upload_link(job_id, version_id)
+        await presigned_transfer_service.upload_file(upload_info.upload_url, results["onnx_path"])
+
+        # 6. 최종 완료 보고 (100%)
+        completion_payload = {
+            "version_id": version_id,
+            "s3_key": f"mlops/models/{version_id}/{job_id}/model.onnx", # 백엔드 규칙에 따라 조정
+            "rmse": metrics["rmse"],
+            "f1_score": metrics["f1_score"],
+            "activate": True
+        }
+        await backend_client.complete_onnx(job_id, completion_payload)
         await backend_client.report_progress(job_id, 100, "COMPLETED", "Pipeline successfully finished")
-        
+
     except Exception as e:
-        logger.error(f"Training pipeline failed for job {job_id}: {e}")
-        # 실패 시 FAILED 상태 콜백
+        logger.error(f"[{job_id}] Pipeline failed: {str(e)}")
         await backend_client.report_progress(job_id, 0, "FAILED", str(e))
+    finally:
+        # 임시 데이터 삭제
+        import shutil
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)

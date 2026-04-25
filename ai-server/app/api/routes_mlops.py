@@ -1,16 +1,37 @@
-from fastapi import APIRouter, BackgroundTasks, status
-from app.schemas.backend_contracts import JobStartRequest
-from app.workers.training_worker import run_training_job
+import logging
+from fastapi import APIRouter, Header, HTTPException, BackgroundTasks
+from app.schemas.backend_contracts import DatasetWebhookPayload
+from app.services.training_service import run_training_pipeline
+from app.config import settings
 
-router = APIRouter()
+router = APIRouter(prefix="/mlops", tags=["MLOps"])
+logger = logging.getLogger(__name__)
 
-@router.post("/jobs/{job_id}/start", status_code=status.HTTP_202_ACCEPTED)
-async def start_job(job_id: str, request: JobStartRequest, background_tasks: BackgroundTasks):
-    # 비동기 task 큐에 등록 후 즉시 accepted 반환
-    background_tasks.add_task(run_training_job, job_id, request)
-    return {"message": "Job accepted"}
+@router.post("/webhook/dataset-links")
+async def receive_dataset_links(
+    payload: DatasetWebhookPayload,
+    background_tasks: BackgroundTasks,
+    authorization: str = Header(None)
+):
+    """
+    백엔드로부터 비동기적으로 데이터셋 링크를 수신하는 Webhook 엔드포인트.
+    """
+    # 1. 인증 토큰 검증
+    expected_token = f"Bearer {settings.MLOPS_CALLBACK_TOKEN}" # 실제 운영시 별도 웹훅 토큰 사용 가능
+    if not authorization or authorization != expected_token:
+        logger.warning(f"Unauthorized webhook access attempt: {authorization}")
+        raise HTTPException(status_code=401, detail="Invalid authorization token")
 
-@router.get("/jobs/{job_id}")
-async def get_job_status(job_id: str):
-    # (선택) 작업 상태 조회 (디버깅용)
-    return {"job_id": job_id, "status": "PENDING_OR_RUNNING"}
+    logger.info(f"[{payload.job_id}] Webhook received with {len(payload.datasets)} datasets")
+
+    # 2. 백그라운드에서 학습 파이프라인 시작
+    background_tasks.add_task(
+        run_training_pipeline,
+        job_id=payload.job_id,
+        version_id=payload.version_id,
+        datasets=payload.datasets,
+        is_finetune=payload.is_finetune,
+        base_model_path=payload.base_model_path
+    )
+
+    return {"status": "accepted", "job_id": payload.job_id}

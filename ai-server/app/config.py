@@ -1,8 +1,9 @@
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
-    BACKEND_BASE_URL: str = "http://localhost:8080"
-    MLOPS_CALLBACK_TOKEN: str = "default_token"
+    BACKEND_BASE_URL: str = "http://13.124.221.116:8080"
+    MLOPS_CALLBACK_TOKEN: str = "T7vu0Sb8TkCyLr1Or8+OC2mHgm94/kis1qdvLoKkDAGkAsTchmMrx1lNkwkmxY9x"
+    MLOPS_PULL_TOKEN: str = "G3RMjLElw33n1/24I0teC3d3KpvdRuaLEMebPB5ZNaO9yaDZqslVhNSQe/hT2nlA"
     
     # Timeout settings
     HTTP_TIMEOUT: int = 30

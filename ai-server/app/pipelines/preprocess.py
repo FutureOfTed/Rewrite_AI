@@ -4,14 +4,11 @@ from typing import Dict, Any, Tuple
 
 
 # ─────────────────────────────────────────────────────────
-# S 레이블 계산에 사용되는 가중치 (합계 = 1.0)
+# S 레이블 초기 계산용 피처 목록
+# 실제 가중치(w1~w4)는 GRU 모델 내부의 nn.Parameter로 학습됩니다.
+# 여기서는 학습 초기 레이블 생성을 위해 균등 평균(1/4)을 사용합니다.
 # ─────────────────────────────────────────────────────────
-S_WEIGHTS = {
-    "accuracy":              0.30,
-    "inverse_hit_rate":      0.30,
-    "attack_item_efficiency":0.20,
-    "hp_retention_rate":     0.20,
-}
+S_FEATURE_COLS = ["accuracy", "inverse_hit_rate", "attack_item_efficiency", "hp_retention_rate"]
 
 # ─────────────────────────────────────────────────────────
 # C 레이블 판정 임계값
@@ -25,7 +22,15 @@ C_PANIC_WINDOW            = 10     # 패닉 난사 감지 윈도우 (초)
 
 def clean_and_feature_engineering(raw_data: Dict[str, Any]) -> pd.DataFrame:
     """
-    원천 데이터를 받아 5개 핵심 피처를 계산하고 결측치를 처리합니다.
+    클라이언트에서 이미 계산된 5개 피처 값을 수신하여 결측치를 처리합니다.
+    서버에서 피처를 재계산하지 않습니다. (책임 분리)
+
+    클라이언트(유니티)에서 전송해야 할 필드 (time_series_frames 내부):
+      - apm                   : 행동 수 / 클리어 시간 (초당 행동 횟수)
+      - inverse_hit_rate      : 1 - (피격 횟수 / 적 발사 탄 수)
+      - hp_retention_rate     : 현재 체력 / 최대 체력
+      - accuracy              : 명중 탄 수 / 전체 발사 탄 수
+      - attack_item_efficiency: 1 - (기본 피해 * 명중 수) / 실제 총 피해
 
     Parameters
     ----------
@@ -33,12 +38,11 @@ def clean_and_feature_engineering(raw_data: Dict[str, Any]) -> pd.DataFrame:
 
     Returns
     -------
-    feature_cols('apm', 'inverse_hit_rate', 'hp_retention_rate',
-                 'accuracy', 'attack_item_efficiency') 만 담긴 DataFrame
+    (feature_df, raw_df) : 피처 DataFrame과 원본 DataFrame 튜플
     """
     frames = raw_data.get("time_series_frames", [])
     if not frames:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
     df = pd.DataFrame(frames)
 
@@ -46,42 +50,7 @@ def clean_and_feature_engineering(raw_data: Dict[str, Any]) -> pd.DataFrame:
     # 네트워크 렉 등으로 인한 NaN 값을 직전 초(t-1) 데이터로 채움
     df = df.ffill()
 
-    # ── 2. APM 재계산: 행동 횟수 / 한 웨이브 클리어 시간 ─────────────────
-    # clear_time_sec: wave_meta에 담겨있는 웨이브 클리어 시간 (초)
-    clear_time_sec = raw_data.get("wave_meta", {}).get("clear_time_sec", None)
-    total_actions  = df["atk_clicks_total"].sum()   # 웨이브 전체 행동 횟수 합계
-    if clear_time_sec and clear_time_sec > 0:
-        # 웨이브 전체 APM을 초당 단위로 환산 후 각 프레임에 동일하게 할당
-        wave_apm = total_actions / clear_time_sec
-    else:
-        # clear_time_sec 미제공 시 실제 프레임 개수로 대체
-        wave_apm = total_actions / max(len(df), 1)
-    df["apm"] = wave_apm  # 모든 프레임에 웨이브 기준 APM을 기입
-
-    # ── 3. 5대 핵심 피처 계산 ─────────────────────────────────────────────
-
-    # 1) APM: 위에서 이미 계산 완료
-
-    # 2) Inverse Hit Rate: 1 - (피격 횟수 / 적이 발사한 총 탄 수)
-    df["inverse_hit_rate"] = 1.0 - (
-        df["hitbox_collisions"] / df["enemy_atk_spawned"].replace(0, 1)
-    )
-
-    # 3) HP Retention Rate: 1 - (잃은 체력 / 최대 체력)
-    df["hp_retention_rate"] = 1.0 - (
-        df["hp_lost"] / df["max_hp"].replace(0, 1)
-    )
-
-    # 4) Accuracy: 명중 탄 수 / 전체 발사 탄 수
-    df["accuracy"] = df["atk_clicks_hit"] / df["atk_clicks_total"].replace(0, 1)
-
-    # 5) Attack Item Efficiency: 1 - (기본 피해량 * 명중 탄 수) / 가한 총 피해량
-    df["attack_item_efficiency"] = 1.0 - (
-        (df["base_dmg_expected"] * df["atk_clicks_hit"])
-        / df["actual_dmg_dealt"].replace(0, 1)
-    )
-
-    # ── 4. 범위 보정 (0.0 이하 클리핑) ───────────────────────────────────
+    # ── 2. 필수 피처 컬럼 존재 여부 검증 ─────────────────────────────────
     feature_cols = [
         "apm",
         "inverse_hit_rate",
@@ -89,9 +58,20 @@ def clean_and_feature_engineering(raw_data: Dict[str, Any]) -> pd.DataFrame:
         "accuracy",
         "attack_item_efficiency",
     ]
-    df[feature_cols] = df[feature_cols].clip(lower=0.0)
+    missing = [col for col in feature_cols if col not in df.columns]
+    if missing:
+        raise ValueError(
+            f"클라이언트 전송 데이터에 필수 피처가 누락되었습니다: {missing}\n"
+            f"유니티에서 time_series_frames 내에 해당 필드를 포함하여 전송해야 합니다."
+        )
 
-    return df[feature_cols], df  # 원본 df도 레이블 계산에 재활용
+    # ── 3. 범위 보정 ───────────────────────────────────────────────────────
+    # APM은 0 이상 양수, 나머지 4개 피처는 0.0 ~ 1.0 범위로 보정
+    df[["apm"]] = df[["apm"]].clip(lower=0.0)
+    rate_cols = ["inverse_hit_rate", "hp_retention_rate", "accuracy", "attack_item_efficiency"]
+    df[rate_cols] = df[rate_cols].clip(lower=0.0, upper=1.0)
+
+    return df[feature_cols], df  # 원본 df도 C 레이블 계산에 재활용
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -100,21 +80,21 @@ def clean_and_feature_engineering(raw_data: Dict[str, Any]) -> pd.DataFrame:
 
 def compute_skill_label(feature_df: pd.DataFrame) -> float:
     """
-    S = w1*Accuracy + w2*Inv_Hit_Rate + w3*Item_Efficiency + w4*HP_Retention
-    (웨이브 전체 프레임의 평균값으로 계산)
+    S 레이블 초기값을 계산합니다.
+
+    실제 가중치(w1~w4)는 GRU 모델의 nn.Parameter(skill_weights)로 학습되며,
+    이 함수는 학습 초기에 사용될 합리적인 초기 레이블(정답)을 제공하기 위해
+    4개 피처의 균등 평균(각 0.25)으로 계산합니다.
+
+    모델이 학습됨에 따라 자체적으로 최적 가중치를 찾아나갑니다.
 
     Returns
     -------
     S : float, 0.0 ~ 1.0
     """
-    means = feature_df.mean()
-    s = (
-        S_WEIGHTS["accuracy"]               * means.get("accuracy", 0.0)
-        + S_WEIGHTS["inverse_hit_rate"]      * means.get("inverse_hit_rate", 0.0)
-        + S_WEIGHTS["attack_item_efficiency"]* means.get("attack_item_efficiency", 0.0)
-        + S_WEIGHTS["hp_retention_rate"]     * means.get("hp_retention_rate", 0.0)
-    )
-    # 부동소수점 오차 보정
+    means = feature_df[S_FEATURE_COLS].mean()
+    # 균등 평균: 각 피처에 동일한 비중 (1/4)
+    s = float(means.mean())
     return float(np.clip(s, 0.0, 1.0))
 
 

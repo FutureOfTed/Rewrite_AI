@@ -1,3 +1,12 @@
+import sys
+import os
+
+# CUDA 라이브러리 경로 추가 (가장 중요!)
+sys.path.append("/usr/local/cuda/lib64")
+
+# Torch CUDA 경로 추가 (필요한 경우)
+sys.path.append("/usr/local/lib/python3.9/site-packages/torch/lib")
+
 from fastapi import FastAPI
 from app.api import routes_health, routes_inference, routes_mlops
 import logging

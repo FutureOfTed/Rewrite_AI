@@ -49,13 +49,23 @@ class DDA_GRU_MultiTask(nn.Module):
             dropout=dropout if num_layers > 1 else 0.0,
         )
 
-        # ── 2. 다중 작업 출력층 (Multi-Task Heads) ────────────────────────
-        # 하나의 은닉 벡터 h_last를 입력받아 S와 C를 독립적으로 추론
+        # ── 2. 학습 가능한 S(숙련도) 가중치 ─────────────────────────────────
+        # 입력 텐서 피처 순서: [apm(0), inv_hit(1), hp_ret(2), accuracy(3), item_eff(4)]
+        # S 가중치는 [accuracy(3), inv_hit(1), item_eff(4), hp_ret(2)] 4개 피처에 적용
+        self.S_FEAT_IDX = [3, 1, 4, 2]
 
-        # S 헤드: 숙련도 점수 (회귀, Regression)
+        # w1~w4를 nn.Parameter로 선언 → backpropagation으로 자동 최적화
+        # 초기값은 균등(0.25)으로 설정, Softmax로 합계가 항상 1.0 유지
+        self.skill_weights = nn.Parameter(
+            torch.tensor([0.25, 0.25, 0.25, 0.25])
+        )
+
+        # ── 3. 다중 작업 출력층 (Multi-Task Heads) ────────────────────────
+
+        # S 헤드: GRU 은닉 벡터(64) + 가중합 스칼라(1) → 총 65 입력
         # Sigmoid → 0.0 ~ 1.0 사이 연속 실수 출력
         self.head_S = nn.Sequential(
-            nn.Linear(hidden_size, 1),
+            nn.Linear(hidden_size + 1, 1),
             nn.Sigmoid(),
         )
 
@@ -71,6 +81,7 @@ class DDA_GRU_MultiTask(nn.Module):
         Parameters
         ----------
         x : [Batch, Sequence(30), Features(5)]
+            피처 순서: [apm, inverse_hit_rate, hp_retention_rate, accuracy, attack_item_efficiency]
 
         Returns
         -------
@@ -83,11 +94,27 @@ class DDA_GRU_MultiTask(nn.Module):
         # 마지막 시점(t=30)의 은닉 상태만 추출 → 맥락이 압축된 최종 벡터
         h_last = gru_out[:, -1, :]  # [Batch, 64]
 
-        # 두 헤드를 통해 S와 C를 동시에 독립 산출
-        s_score = self.head_S(h_last)  # [Batch, 1]
-        c_risk  = self.head_C(h_last)  # [Batch, 1]
+        # ── S(?숙련도) 산출: 학습 가능한 가중치 적용 ──────────────────────
+        # 마지막 프레임(t=30)의 S 관련 4개 피처만 추출
+        # S_FEAT_IDX: [accuracy(3), inv_hit_rate(1), item_eff(4), hp_retention(2)]
+        s_features = x[:, -1, :][:, self.S_FEAT_IDX]  # [Batch, 4]
+
+        # Softmax로 가중치를 정규화하여 w1+w2+w3+w4 = 1.0 커제적으로 유지
+        w = torch.softmax(self.skill_weights, dim=0)  # [4]
+
+        # 피처별 가중합: 단순 평균이 아닌 모델이 학습한 가중치로 계산
+        s_weighted = (w * s_features).sum(dim=1, keepdim=True)  # [Batch, 1]
+
+        # GRU 맥락(h_last) + 학습된 가중합을 함께 헤드에 입력
+        # → GRU가 리즈을 완전히 파악하면 가중치에 편향을 줌, 파악 몦하면 업고 관리함
+        s_input = torch.cat([h_last, s_weighted], dim=1)  # [Batch, 65]
+        s_score = self.head_S(s_input)   # [Batch, 1]
+
+        # ── C(이탈 위험도) 산출: GRU 은닉 벡터만 사용 ──────────────────────
+        c_risk = self.head_C(h_last)     # [Batch, 1]
 
         return s_score, c_risk
+
 
 
 class Predictor:
