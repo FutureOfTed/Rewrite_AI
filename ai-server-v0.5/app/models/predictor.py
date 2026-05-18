@@ -62,17 +62,21 @@ class DDA_GRU_MultiTask(nn.Module):
 
         # ── 3. 다중 작업 출력층 (Multi-Task Heads) ────────────────────────
 
-        # S 헤드: GRU 은닉 벡터(64) + 가중합 스칼라(1) → 총 65 입력
-        # Sigmoid → 0.0 ~ 1.0 사이 연속 실수 출력
-        self.head_S = nn.Sequential(
-            nn.Linear(hidden_size + 1, 1),
-            nn.Sigmoid(),
+        # S 헤드 (Residual Delta 구조)
+        # S값 변동이 거의 없는 문제를 해결하기 위해, 신경망이 0~1 전체를 예측하는 대신
+        # 피처 가중합(기초 점수)에 더해질 '보정치(-1.0 ~ 1.0)'만 학습하도록 강제합니다.
+        self.head_S_delta = nn.Sequential(
+            nn.Linear(hidden_size, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+            nn.Tanh(),  # -1.0 ~ 1.0 보정(Delta)
         )
 
-        # C 헤드: 이탈 위험도 (이진 분류 확률, Classification)
-        # Sigmoid → 0.0 ~ 1.0 이탈 확률 출력 (BCE Loss 와 함께 사용)
+        # C 헤드: 이탈 위험도 (더 다이내믹하게 변하도록 은닉층 추가)
         self.head_C = nn.Sequential(
-            nn.Linear(hidden_size, 1),
+            nn.Linear(hidden_size, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
             nn.Sigmoid(),
         )
 
@@ -99,18 +103,19 @@ class DDA_GRU_MultiTask(nn.Module):
         # S_FEAT_IDX: [accuracy(3), inv_hit_rate(1), item_eff(4), hp_retention(2)]
         s_features = x[:, -1, :][:, self.S_FEAT_IDX]  # [Batch, 4]
 
-        # Softmax로 가중치를 정규화하여 w1+w2+w3+w4 = 1.0 커제적으로 유지
+        # Softmax로 가중치를 정규화하여 w1+w2+w3+w4 = 1.0 유지
         w = torch.softmax(self.skill_weights, dim=0)  # [4]
 
-        # 피처별 가중합: 단순 평균이 아닌 모델이 학습한 가중치로 계산
+        # 피처별 가중합 (Base Score) - 이것만으로도 유저의 현재 실력이 매우 다이내믹하게 반영됨
         s_weighted = (w * s_features).sum(dim=1, keepdim=True)  # [Batch, 1]
 
-        # GRU 맥락(h_last) + 학습된 가중합을 함께 헤드에 입력
-        # → GRU가 리즈을 완전히 파악하면 가중치에 편향을 줌, 파악 몦하면 업고 관리함
-        s_input = torch.cat([h_last, s_weighted], dim=1)  # [Batch, 65]
-        s_score = self.head_S(s_input)   # [Batch, 1]
+        # GRU 맥락(h_last)을 통해 과거 흐름을 반영한 보정치(Delta) 추출 (-1.0 ~ 1.0)
+        s_delta = self.head_S_delta(h_last)   # [Batch, 1]
+        
+        # 최종 점수 = 기초 점수 + 보정치 (0.0 ~ 1.0 사이로 클리핑)
+        s_score = torch.clamp(s_weighted + s_delta, 0.0, 1.0)
 
-        # ── C(이탈 위험도) 산출: GRU 은닉 벡터만 사용 ──────────────────────
+        # ── C(이탈 위험도) 산출 ───────────────────────────────────────────
         c_risk = self.head_C(h_last)     # [Batch, 1]
 
         return s_score, c_risk

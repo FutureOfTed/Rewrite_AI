@@ -6,7 +6,7 @@
       → GRU 모델 학습 (Early Stopping)
       → 검증 평가 (RMSE / F1-Score)
       → 최적 가중치 저장 (.pt)
-      → ONNX 변환 (.onnx)
+      [ONNX 변환은 onnx-upload-link 웹훅 수신 시 별도 수행]
 """
 
 import logging
@@ -18,6 +18,17 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import f1_score
+
+class TrainingFailSafeException(Exception):
+    """
+    Fail Safe (Training Safety) 예외 클래스
+    배치 크기 미달(501), 텐서 오류(503) 등 선제적 방어를 위한 예외
+    """
+    def __init__(self, code: int, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(self.message)
+
 
 from app.models.predictor import DDA_GRU_MultiTask
 from app.pipelines.preprocess import (
@@ -53,7 +64,7 @@ LOSS_WEIGHT_S = 0.5   # 숙련도 손실 가중치
 
 # ONNX 관련
 ONNX_OPSET_VERSION = 12   # Unity Sentis 엔진과 가장 안정적으로 호환되는 버전
-WINDOW_SIZE  = 30     # 슬라이딩 윈도우 크기 (초)
+WINDOW_SIZE  = 5      # 슬라이딩 윈도우 크기 (초) - 짧은 웨이브 데이터 대응
 
 
 # 학습 서버는 GPU 1번을 전용으로 사용
@@ -190,10 +201,11 @@ def export_to_onnx(model: DDA_GRU_MultiTask, save_path: str):
     save_path : ONNX 파일 저장 경로 (.onnx)
     """
     model.eval()
+    device = next(model.parameters()).device  # 모델이 현재 위치한 장치 확인
 
     # 클라이언트 환경 모사: Batch=1 (유저 1명, 실시간 추론)
-    # 형태: [Batch=1, Timesteps=30, Features=5]
-    dummy_input = torch.randn(1, WINDOW_SIZE, INPUT_SIZE)
+    # 형태: [Batch=1, Timesteps=5, Features=5]
+    dummy_input = torch.randn(1, WINDOW_SIZE, INPUT_SIZE).to(device)
 
     torch.onnx.export(
         model,
@@ -201,11 +213,11 @@ def export_to_onnx(model: DDA_GRU_MultiTask, save_path: str):
         save_path,
         export_params=True,
         opset_version=ONNX_OPSET_VERSION,  # Unity Sentis 호환 최적 버전
-        input_names=["game_metrics_30s"],  # Unity C# Tensor 주입 키
+        input_names=["game_metrics_5s"],   # Unity C# Tensor 주입 키
         output_names=["S_score", "C_risk"],# Unity C# 추론 결과 호출 키
         dynamic_axes={
             # 배치 크기를 동적으로 허용 (클라이언트 1명 ~ 서버 배치 추론 모두 대응)
-            "game_metrics_30s": {0: "batch_size"},
+            "game_metrics_5s":  {0: "batch_size"},
             "S_score":          {0: "batch_size"},
             "C_risk":           {0: "batch_size"},
         },
@@ -241,10 +253,12 @@ def execute(
         try:
             feature_df, raw_df = clean_and_feature_engineering(raw_data)
             if feature_df.empty:
+                logger.warning(f"웨이브 {wave_idx}: feature_df가 비어 있습니다. (원본 데이터 프레임 수: {len(raw_data) if isinstance(raw_data, list) else len(raw_data.get('time_series_frames', []))})")
                 continue
 
             windows = create_sliding_windows(feature_df, window_size=WINDOW_SIZE)
             if windows.size == 0:
+                logger.warning(f"웨이브 {wave_idx}: 슬라이딩 윈도우 생성 후 텐서가 비어 있습니다. (데이터 길이: {len(feature_df)}, WINDOW_SIZE: {WINDOW_SIZE})")
                 continue
 
             s_label = compute_skill_label(feature_df)
@@ -268,11 +282,29 @@ def execute(
         raise ValueError("전처리 후 유효한 학습 샘플이 없습니다.")
 
     # ── 2. 정규화 및 데이터셋 조립 ────────────────────────────────────────
-    X, y_s, y_c = build_dataset(sample_list)
-    X = normalize_tensor(X)
-
-    # ── 3. DataLoader 생성 (Train 80% / Val 10% / Test 10%) ──────────────
-    train_loader, val_loader, test_loader = _build_dataloaders(X, y_s, y_c)
+    try:
+        X, y_s, y_c = build_dataset(sample_list)
+        
+        # 501 Error: 배치 사이즈 검증 (Training Safety)
+        if len(X) < BATCH_SIZE:
+            raise TrainingFailSafeException(
+                501, 
+                f"[에러 코드 501] 재학습 로그 데이터 분량 부족. 현재 텐서 크기({len(X)})가 배치 사이즈({BATCH_SIZE})를 충족하지 못했습니다."
+            )
+            
+        X = normalize_tensor(X)
+        
+        # ── 3. DataLoader 생성 (Train 80% / Val 10% / Test 10%) ──────────────
+        train_loader, val_loader, test_loader = _build_dataloaders(X, y_s, y_c)
+        
+    except TrainingFailSafeException:
+        raise
+    except Exception as e:
+        # 503 Error: 텐서 차원 불일치 등 치명적 오류 (Training Safety)
+        raise TrainingFailSafeException(
+            503, 
+            f"[에러 코드 503] 데이터 전처리 또는 텐서 조립 중 치명적 오류 발생: {str(e)}"
+        )
 
     # ── 4. 모델 / 옵티마이저 / 손실함수 초기화 ──────────────────────────
     model = DDA_GRU_MultiTask(
@@ -336,18 +368,14 @@ def execute(
             logger.info(f"Early Stopping 발동! (Epoch {epoch}에서 학습 종료)")
             break
 
-    # ── 6. 최종 평가 및 ONNX 변환 ────────────────────────────────────────
+    # ── 6. 최종 평가 (학습 완료, ONNX 변환은 onnx-upload-link 웹훅 수신 시 수행) ───────
     model.load_state_dict(torch.load(best_weights_path, map_location=device))
     test_metrics = _evaluate(model, test_loader, loss_fn_bce, loss_fn_mse, device)
-    
-    onnx_path = os.path.join(output_dir, "DDA_GRU_MultiTask.onnx")
-    export_to_onnx(model, onnx_path)
 
     metrics = {
-        "rmse":      test_metrics["rmse"],
-        "f1_score":  test_metrics["f1_score"],
-        "pt_path":   best_weights_path,
-        "onnx_path": onnx_path,
+        "rmse":     test_metrics["rmse"],
+        "f1_score": test_metrics["f1_score"],
+        "pt_path":  best_weights_path,
     }
-    logger.info(f"파이프라인 완료: {metrics}")
+    logger.info(f"파이프라인 완료 (ONNX 변환 제외): {metrics}")
     return metrics

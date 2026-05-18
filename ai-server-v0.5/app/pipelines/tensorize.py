@@ -7,22 +7,22 @@ from typing import Dict, Any, Tuple, List
 
 def create_sliding_windows(
     df: pd.DataFrame,
-    window_size: int = 30,
+    window_size: int = 5,
     stride: int = 1,
 ) -> np.ndarray:
     """
-    피처 데이터프레임을 받아 30초 단위 슬라이딩 윈도우 텐서를 생성합니다.
+    피처 데이터프레임을 받아 5초 단위 슬라이딩 윈도우 텐서를 생성합니다.
     이상치 필터링(AFK/자리비움, 매크로 의심)이 포함됩니다.
 
     Parameters
     ----------
     df          : clean_and_feature_engineering() 의 반환값 (feature_df)
-    window_size : 윈도우 크기 (기본값 30초)
+    window_size : 윈도우 크기 (기본값 5초)
     stride      : 슬라이딩 이동 간격 (기본값 1초)
 
     Returns
     -------
-    ndarray : shape [Batch, Timesteps(30), Features(5)]
+    ndarray : shape [Batch, Timesteps(5), Features(5)]
     """
     if len(df) < window_size:
         return np.empty((0, window_size, df.shape[1]))
@@ -50,37 +50,17 @@ def create_sliding_windows(
     if not windows:
         return np.empty((0, window_size, df.shape[1]))
 
-    # 최종 텐서 형태: [Batch, Timesteps(30), Features(5)]
+    # 최종 텐서 형태: [Batch, Timesteps(5), Features(5)]
     return np.array(windows, dtype=np.float32)
 
 
 def normalize_tensor(tensor: np.ndarray) -> np.ndarray:
     """
-    Min-Max Scaler를 적용하여 모든 피처 값을 0.0 ~ 1.0 사이로 정규화합니다.
-    기울기 폭발 방지 및 피처 간 스케일 차이 극복.
-
-    Notes
-    -----
-    - 정규화는 배치 전체 분포를 기준으로 수행됩니다.
-    - 학습 데이터의 scaler를 저장하여 추론 시에도 동일하게 적용해야 합니다.
-
-    Returns
-    -------
-    ndarray : shape [Batch, Timesteps(30), Features(5)], 값 범위 0.0 ~ 1.0
+    (수정됨) preprocess.py에서 이미 모든 피처(APM 포함)를 0.0 ~ 1.0으로 정규화했으므로,
+    여기서 MinMaxScaler를 다시 적용하지 않고 그대로 반환합니다.
+    이렇게 해야 학습과 유니티(클라이언트) 추론 시 스케일이 100% 일치합니다.
     """
-    if tensor.size == 0:
-        return tensor
-
-    batch_size, timesteps, features = tensor.shape
-
-    # 2D로 펼쳐서 스케일링
-    flattened = tensor.reshape(-1, features)
-
-    scaler = MinMaxScaler(feature_range=(0.0, 1.0))
-    normalized_flattened = scaler.fit_transform(flattened)
-
-    # 다시 3D 텐서 형태로 복원
-    return normalized_flattened.reshape(batch_size, timesteps, features).astype(np.float32)
+    return tensor
 
 
 def build_dataset(

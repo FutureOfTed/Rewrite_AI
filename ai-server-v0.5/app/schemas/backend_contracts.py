@@ -6,10 +6,16 @@ from pydantic import BaseModel, Field
 # 백엔드 연동용 요청/응답 스키마
 
 class JobStartRequest(BaseModel):
-    date_from: str
-    date_to: str
-    dataset_prefix: str
-    # 필요한 파라미터 추가
+    job_id: Optional[str] = Field(alias="jobId", default=None)
+    candidate_version_id: Optional[str] = None
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    dataset_prefix: Optional[str] = None
+    requested_by: Optional[str] = None
+    requested_at: Optional[str] = None
+
+    class Config:
+        populate_by_name = True
 
 class DatasetLinkInfo(BaseModel):
     s3_key: str = Field(alias="s3Key")

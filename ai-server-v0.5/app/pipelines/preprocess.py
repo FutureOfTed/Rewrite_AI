@@ -13,9 +13,9 @@ S_FEATURE_COLS = ["accuracy", "inverse_hit_rate", "attack_item_efficiency", "hp_
 # ─────────────────────────────────────────────────────────
 # C 레이블 판정 임계값
 # ─────────────────────────────────────────────────────────
-C_TILT_DROP_THRESHOLD     = 0.30   # 틸트: 평균 대비 30% 이상 폭락
-C_CHAIN_HIT_HP_THRESHOLD  = 0.50   # 연쇄 피격: 5~7초 내 체력 50% 이상 감소
-C_PANIC_ACC_THRESHOLD     = 0.50   # 패닉 난사: 마지막 10초 명중률 평균 대비 50% 이하
+C_TILT_DROP_THRESHOLD     = 0.15   # 틸트: 평균 대비 15% 이상 폭락 (기존 0.30)
+C_CHAIN_HIT_HP_THRESHOLD  = 0.30   # 연쇄 피격: 5~7초 내 체력 30% 이상 감소 (기존 0.50)
+C_PANIC_ACC_THRESHOLD     = 0.70   # 패닉 난사: 마지막 10초 명중률 평균 대비 70% 이하 (기존 0.50)
 C_CHAIN_HIT_WINDOW        = 7      # 연쇄 피격 감지 윈도우 (초)
 C_PANIC_WINDOW            = 10     # 패닉 난사 감지 윈도우 (초)
 
@@ -40,7 +40,11 @@ def clean_and_feature_engineering(raw_data: Dict[str, Any]) -> pd.DataFrame:
     -------
     (feature_df, raw_df) : 피처 DataFrame과 원본 DataFrame 튜플
     """
-    frames = raw_data.get("time_series_frames", [])
+    if isinstance(raw_data, list):
+        frames = raw_data
+    else:
+        frames = raw_data.get("time_series_frames", [])
+        
     if not frames:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -65,9 +69,12 @@ def clean_and_feature_engineering(raw_data: Dict[str, Any]) -> pd.DataFrame:
             f"유니티에서 time_series_frames 내에 해당 필드를 포함하여 전송해야 합니다."
         )
 
-    # ── 3. 범위 보정 ───────────────────────────────────────────────────────
-    # APM은 0 이상 양수, 나머지 4개 피처는 0.0 ~ 1.0 범위로 보정
-    df[["apm"]] = df[["apm"]].clip(lower=0.0)
+    # ── 3. 범위 보정 및 스케일링 (수동 정규화) ─────────────────────────────────
+    # 기존에 MinMaxScaler를 썼으나 추론 시 스케일러가 유실되는 문제를 막기 위해 수동으로 0~1로 맞춥니다.
+    # APM은 최대 500으로 가정하고 나누어 0.0 ~ 1.0으로 정규화
+    df[["apm"]] = df[["apm"]].clip(lower=0.0, upper=500.0) / 500.0
+    
+    # 나머지 4개 비율(Rate) 피처는 본래 0.0 ~ 1.0 범위이므로 클리핑만 수행
     rate_cols = ["inverse_hit_rate", "hp_retention_rate", "accuracy", "attack_item_efficiency"]
     df[rate_cols] = df[rate_cols].clip(lower=0.0, upper=1.0)
 
@@ -95,6 +102,12 @@ def compute_skill_label(feature_df: pd.DataFrame) -> float:
     means = feature_df[S_FEATURE_COLS].mean()
     # 균등 평균: 각 피처에 동일한 비중 (1/4)
     s = float(means.mean())
+    
+    # [조정] 전반적인 피처 값이 낮아 S값이 낮게(0.16 등) 머무는 현상 보정
+    # 스케일을 키워주기 위해 배수를 곱하거나 제곱근(np.sqrt)을 취합니다.
+    # 예: 기본값이 0.16일 때 3.0배를 곱하면 0.48, 4.0배를 곱하면 0.64가 됩니다.
+    s = s * 3.0
+    
     return float(np.clip(s, 0.0, 1.0))
 
 
@@ -134,7 +147,13 @@ def _is_instant_quit_on_death(raw_data: Dict[str, Any]) -> bool:
     실제 구현 시 백엔드의 게임 종료 타임스탬프와 사망 타임스탬프 차이가 필요하나,
     현재 데이터 구조에서는 마지막 프레임의 HP가 0인지 여부로 근사.
     """
-    frames = raw_data.get("time_series_frames", [])
+    if isinstance(raw_data, list):
+        frames = raw_data
+        fail_safe = False
+    else:
+        frames = raw_data.get("time_series_frames", [])
+        fail_safe = raw_data.get("wave_meta", {}).get("fail_safe", False)
+        
     if len(frames) < 2:
         return False
 
@@ -142,12 +161,13 @@ def _is_instant_quit_on_death(raw_data: Dict[str, Any]) -> bool:
     last_frame = frames[-1]
     max_hp  = last_frame.get("max_hp", 1)
     hp_lost = last_frame.get("hp_lost", 0)
-    # HP가 0이 된 것(사망)을 마지막 프레임 hp_lost == max_hp로 판정
+    # HP가 0이 된 것(사망)을 마지막 프레임 hp_lost >= max_hp로 판정
     is_dead = hp_lost >= max_hp
 
-    # 세션 종료 플래그 (백엔드에서 별도로 전달 시 활용)
-    # 현재 구조에서는 fail_safe 필드가 비정상 종료를 의미하는 것으로 해석
-    fail_safe = raw_data.get("wave_meta", {}).get("fail_safe", False)
+    if isinstance(raw_data, list):
+        fail_safe = False
+    else:
+        fail_safe = raw_data.get("wave_meta", {}).get("fail_safe", False)
 
     return is_dead and fail_safe
 
@@ -156,8 +176,13 @@ def _is_chain_hit_collapse(raw_data: Dict[str, Any]) -> bool:
     """
     [C 기준 3] 연쇄 피격 붕괴: 사망 직전 5~7초 내 최대 체력 50% 이상 급감 후 종료.
     """
-    frames = raw_data.get("time_series_frames", [])
-    fail_safe = raw_data.get("wave_meta", {}).get("fail_safe", False)
+    if isinstance(raw_data, list):
+        frames = raw_data
+        fail_safe = False
+    else:
+        frames = raw_data.get("time_series_frames", [])
+        fail_safe = raw_data.get("wave_meta", {}).get("fail_safe", False)
+        
     if not fail_safe or len(frames) < C_CHAIN_HIT_WINDOW:
         return False
 
@@ -175,12 +200,28 @@ def _is_panic_spray(feature_df: pd.DataFrame, raw_data: Dict[str, Any]) -> bool:
     [C 기준 4] 패닉 난사: 마지막 10초 명중률이 웨이브 평균 대비 50% 이하이면서
     APM은 오히려 올라간 상태.
     """
-    fail_safe = raw_data.get("wave_meta", {}).get("fail_safe", False)
+    if isinstance(raw_data, list):
+        frames = raw_data
+        fail_safe = False
+    else:
+        frames = raw_data.get("time_series_frames", [])
+        fail_safe = raw_data.get("wave_meta", {}).get("fail_safe", False)
+        
     if not fail_safe:
         return False
 
     n = len(feature_df)
-    if n < C_PANIC_WINDOW:
+    if n < C_PANIC_WINDOW or len(frames) == 0:
+        return False
+
+    # 추가: 체력이 0이 되기 직전(또는 0이 된 상태)인지 확인
+    last_frame = frames[-1]
+    max_hp = last_frame.get("max_hp", 1)
+    hp_lost = last_frame.get("hp_lost", 0)
+    # 체력을 다 잃었는지(사망) 확인
+    is_dying = hp_lost >= max_hp
+    
+    if not is_dying:
         return False
 
     wave_avg_acc  = feature_df["accuracy"].mean()
