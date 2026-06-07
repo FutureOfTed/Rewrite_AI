@@ -31,24 +31,38 @@ async def get_dataset_links(job_id: str) -> List[DatasetLinkInfo]:
     """
     url = f"{settings.BACKEND_BASE_URL}/api/v1/mlops/pull/jobs/{job_id}/dataset-links"
     headers = get_pull_headers()
-    payload = {"page": 0, "size": 200}  # 필요 시 페이지 순회 로직 추가 가능
+    all_links: List[DatasetLinkInfo] = []
+    page = 0
+    size = 200
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        
-        # 페이지네이션 객체 내부의 "links" 리스트 파싱
-        links_data = data.get("links", [])
-        return [DatasetLinkInfo(**item) for item in links_data]
+    timeout = httpx.Timeout(settings.HTTP_TIMEOUT)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        while True:
+            payload = {"page": page, "size": size}
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
 
-async def issue_onnx_upload_link(job_id: str, version_id: str) -> OnnxUploadLinkResponse:
-    """모델 업로드용 Presigned URL 요청 (Pull 방식)"""
+            links_data = data.get("links", [])
+            all_links.extend([DatasetLinkInfo(**item) for item in links_data])
+
+            total_pages = int(data.get("totalPages", 0))
+            current_page = int(data.get("page", page))
+            if total_pages <= 0 or current_page + 1 >= total_pages:
+                break
+            page += 1
+
+    logger.info("[%s] fetched dataset links: %s", job_id, len(all_links))
+    return all_links
+
+async def issue_onnx_upload_link(job_id: str, version_id: str, file_name: str = "model.onnx") -> OnnxUploadLinkResponse:
+    """모델 업로드용 Presigned URL 요청 (Pull 전용 서버-서버 API)"""
     url = f"{settings.BACKEND_BASE_URL}/api/v1/mlops/pull/jobs/{job_id}/onnx-upload-link"
     headers = get_pull_headers()
-    payload = {"version_id": version_id}
+    payload = {"version_id": version_id, "file_name": file_name}
     
-    async with httpx.AsyncClient() as client:
+    timeout = httpx.Timeout(settings.HTTP_TIMEOUT)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(url, headers=headers, json=payload)
         response.raise_for_status()
         return OnnxUploadLinkResponse(**response.json())
@@ -62,7 +76,8 @@ async def report_progress(job_id: str, percent: int, status: str, message: str =
         "progress_percent": percent,
         "progress_message": message
     }
-    async with httpx.AsyncClient() as client:
+    timeout = httpx.Timeout(settings.HTTP_TIMEOUT)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.patch(url, headers=headers, json=payload)
         response.raise_for_status()
 
@@ -70,14 +85,47 @@ async def report_metrics(job_id: str, metrics: Dict[str, Any]):
     """평가 지표 보고 콜백 (POST)"""
     url = f"{settings.BACKEND_BASE_URL}/api/v1/mlops/callback/jobs/{job_id}/metrics"
     headers = get_callback_headers()
-    async with httpx.AsyncClient() as client:
+    timeout = httpx.Timeout(settings.HTTP_TIMEOUT)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(url, headers=headers, json=metrics)
         response.raise_for_status()
 
 async def complete_onnx(job_id: str, payload: Dict[str, Any]):
-    """모델 업로드 완료 보고 콜백 (POST)"""
+    """모델 업로드 완료 보고 콜백 (POST) - 지수 백오프 재시도 포함"""
     url = f"{settings.BACKEND_BASE_URL}/api/v1/mlops/callback/jobs/{job_id}/onnx-complete"
     headers = get_callback_headers()
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
+    timeout = httpx.Timeout(settings.HTTP_TIMEOUT)
+
+    import asyncio
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                logger.info(f"[{job_id}] ONNX complete callback 성공")
+                return
+        except Exception as e:
+            wait_sec = 2 ** attempt  # 1초 → 2초 → 4초
+            logger.warning(f"[{job_id}] ONNX complete callback 실패 (시도 {attempt+1}/3): {e}. {wait_sec}초 후 재시도...")
+            await asyncio.sleep(wait_sec)
+    logger.error(f"[{job_id}] ONNX complete callback 최종 실패")
+    raise RuntimeError("ONNX complete callback failed after 3 attempts")
+
+
+async def report_training_complete(job_id: str, rmse: float, f1_score: float):
+    """
+    학습 완료 시 RMSE/F1 지표 보고 후 COMPLETED 상태를 순차적으로 보고합니다.
+
+    dispatch API 플로우 마지막 단계에서 호출됩니다.
+    (ONNX 변환은 이 시점에 수행하지 않습니다.)
+    """
+    metrics = {
+        "rmse":     round(float(rmse), 4),
+        "f1_score": round(float(f1_score), 4),
+    }
+    await report_metrics(job_id, metrics)
+    await report_progress(
+        job_id, 100, "COMPLETED",
+        f"Training done. RMSE={metrics['rmse']}, F1={metrics['f1_score']}"
+    )
+    logger.info(f"[{job_id}] Training complete reported to backend.")
